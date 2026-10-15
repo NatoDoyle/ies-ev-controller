@@ -26,19 +26,21 @@ The project is not in git. The logbook (digital, printed if needed) has not been
 | Rig goal (5 Nov) | Open-loop: throttle → ESP32 PWM → rig motor; ESP32 measures speed + armature current; dashboard shows them |
 | Learning bar | You can explain every line (Claude may write code, with explain-it checkpoints) |
 | Hardware | WROVER + kit at home; rig **lab only, Thursdays, none in reading week** |
-| Rig facts known | 24 V DC motor, armature current out 1 V/A, DVM ±19.9 V; manual not online |
+| Rig facts known | Speed output is a 0–5 V square wave; 24 V DC motor; armature current out 1 V/A (max voltage not yet known); DVM ±19.9 V; manual not online |
+| Motor drive | Your own TIP121 low-side stage switches the rig's 24 V motor |
 | Poster | A3, design/plan poster (no results needed), plan for **22 Oct** |
 | Logbook | **Digital**, printed if needed; not started |
 | Report | No spec given |
 | Git | Public GitHub repo, noreply identity |
 
 ## Choices made on your behalf (approved 15 Oct; revisit if wrong)
-1. **Motor drive:** your own TIP120/121 low-side stage + flyback diode from a 24 V supply (matches the whiteboard,
+1. **Motor drive details:** TIP121 low-side + flyback diode from a 24 V supply (matches the whiteboard,
    testable at home on the kit motor at 5 V, your circuit to explain). Fallback: the rig's built-in amplifier input.
-2. **Current sense:** the rig's 1 V/A output → divider + clamp → ESP32 ADC (assumed one direction, ~0–3 A useful).
+2. **Current sense:** the rig's 1 V/A output → resistor divider sized so 5 V reads about 3.0 V → ESP32 ADC
+   (the ADC is only accurate up to about 3.1 V), plus a clamp until the real maximum is measured. Assumed one direction.
    Fallback: a shunt resistor in the TIP12x emitter.
-3. **Speed input:** a protected input (series resistor + clamp to 3.3 V, or an optocoupler) that survives
-   anything from 5 V to 24 V, because the encoder's output level is unknown until measured.
+3. **Speed input:** the rig's 0–5 V square wave → resistor divider (5 V → about 3.3 V) → an ESP32 interrupt pin.
+   Confirm with a scope on 22 Oct before connecting.
 4. **Speed code:** port the tested speed estimator from FS MCU (`lib/mcu_core/src/speed.*`) into
    `lib/ev_logic` (same author, copied, FS MCU not touched). Unit: motor-shaft rpm (slots per rev counted in the lab).
 5. **Throttle/brake stay on the joystick** as now; brake still forces motor duty to 0.
@@ -59,9 +61,9 @@ The project is not in git. The logbook (digital, printed if needed) has not been
 | O0 | Project under version control | 16 Oct | `IES/` is a public GitHub repo; first commit = current state; PDFs/photos ignored | — |
 | O1 | Base build runs on real hardware | 21 Oct (home) | Every existing feature verified on the wired WROVER against a written checklist: 5 switches, joystick X/Y/SEL, LDR headlights, LM35 temp, indicators, gears, motor PWM, brake light, Processing dashboard | You can trace one switch press from pin to dashboard |
 | O2 | A3 poster | 22 Oct | Print-ready A3 PDF: problem, system block diagram (inputs → ESP32 → drive/rig → dashboard), circuits, plan to Dec | You can present it in 2 min |
-| O3 | Speed sensor on the rig | 22 Oct (lab) | Rig disc pulses → protected input → ESP32 → rpm on Processing; agrees with the rig's RPM display within ±5 % at 3 speeds. Encoder level + slot count measured and logged | You can explain ISR timing → rpm maths |
+| O3 | Speed sensor on the rig | 22 Oct (lab) | Rig disc pulses (0–5 V) → divider → ESP32 → rpm on Processing; agrees with the rig's RPM display within ±5 % at 3 speeds. Pulse level confirmed and slot count measured, both logged | You can explain ISR timing → rpm maths |
 | O4 | Rig open-loop drive | 5 Nov (lab) | Joystick throttle sets PWM → TIP12x → rig motor; 0 % = stopped; brake = 0 duty. Tested first at home on the kit motor | You can explain the drive circuit and base-resistor maths |
-| O5 | Motor current sense | 5 Nov (lab) | Rig 1 V/A out → ESP32 → amps on Processing; agrees with a meter within ±10 % at 2 loads | You can explain the divider/clamp choice |
+| O5 | Motor current sense | 5 Nov (lab) | Rig 1 V/A out → ESP32 → amps on Processing; agrees with a meter within ±10 % at 2 loads | You can explain the divider values |
 | O6 | Dashboard shows new data | 5 Nov | Processing shows rpm and motor current live, alongside everything from O1; the serial line format is documented | You can explain the transmit array fields |
 | O7 | Test data for the report | 26 Nov (labs 12/19/26 Nov) | Logged runs: speed vs duty curve, current vs load, plus the O3/O5 accuracy checks, saved as CSV | You can explain what the curves show |
 | O8 | Report | 3 Dec | Technical report covering O1–O7 with real data, circuits, flowcharts, a full pin map, and limitations | You wrote/understand every section |
@@ -82,13 +84,13 @@ Stretch, only once O0–O11 are on track: web dashboard shows rpm/current; brake
 
 ## Risks
 - **Only two rig sessions before the milestones**, so everything must work first time → home testing with simulated signals, and a written lab-session checklist for each visit.
-- **Encoder output level unknown** → protected input; measure on 22 Oct.
+- **A 5 V signal straight into a 3.3 V pin** can damage the ESP32 → every rig signal goes through a divider; check the level with a scope first.
 - **Base build never run on hardware** → O1 first; any bring-up bug eats into the 22 Oct prep.
 - **Poster date uncertain** → planned for 22 Oct; confirm this week.
-- **24 V near a 3.3 V ESP32** → common ground, clamps on every rig signal, and power-up order written down.
+- **24 V motor supply on the same bench** → common ground with the rig, never wire with power on, power-up order written down.
 
 ## Still unknown (to find out, not decide)
-Poster date (22 Oct or 5 Nov) · rig encoder voltage + slots/rev · rig motor terminal access · component weights of report/demo.
+Poster date (22 Oct or 5 Nov) · slots per rev · current output's maximum voltage · rig motor terminal access · component weights of report/demo.
 
 ## Verification (of the outcomes as a whole)
 - Each outcome's "done when" is checked on real hardware or as a real artifact (no "should work").
