@@ -1,0 +1,709 @@
+<!--
+  Written         08/10/2026
+  by              Nathan Doyle
+  Student No.     X0000000
+  Revision:       1.0
+  Hardware:       ESP32-WROVER-E DevKit (serves this page over WiFi)
+  Description:    Live web dashboard for the EV Controller Interface.
+                  The ESP32 serves this single self-contained page from flash
+                  while running as a WiFi access point, then streams the
+                  "$EV,..." transmit array (21 integers, 10 Hz) over the
+                  WebSocket at ws://<host>/ws. The page parses each line and
+                  shows ignition, gear, motor power, throttle, brake, steering,
+                  indicators, headlights / LDR, temperature, switch states and
+                  a 7-segment mirror of the physical lamps.
+                  No CDN, web fonts or external images are used because phones
+                  joined to the ESP32 access point have no internet access.
+                  Add ?demo=1 to the URL (or open the file directly from disk)
+                  to run a built-in simulator through the same parser.
+  History:        V1.0 :- 20261008  First version.
+  Configuration:  Join WiFi "EV-Dashboard", open http://192.168.4.1
+-->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0b0f14">
+<title>EV Dashboard</title>
+<style>
+  /* ---------- Design tokens (colours, sizes, fonts) ---------- */
+  :root {
+    color-scheme: dark;
+    --bg: #0b0f14;          /* page background */
+    --panel: #131a22;       /* card background */
+    --panel-2: #1a232e;     /* inset / track background */
+    --border: #243040;      /* card border */
+    --text: #e6edf3;        /* main text */
+    --muted: #8b98a5;       /* labels and hints */
+    --off: #263241;         /* unlit lamp / segment */
+    --ok: #3ddc84;          /* connected, ignition on */
+    --warn: #ffb020;        /* reconnecting, stale */
+    --danger: #ff4d4f;      /* overheat */
+    --info: #4da3ff;        /* demo mode */
+    --amber: #ffb020;       /* indicator lamps */
+    --head: #f4f1c9;        /* headlight */
+    --brake: #ff3b30;       /* brake light */
+    --motor: #33c3ff;       /* motor power arc */
+    --throttle: #3ddc84;    /* throttle arc */
+    --radius: 14px;
+    --gap: 12px;
+    --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.4 var(--font);
+    overflow-x: hidden;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 12px 16px 24px; }
+
+  /* ---------- Header with connection status ---------- */
+  header {
+    display: flex; flex-wrap: wrap; align-items: center;
+    justify-content: space-between; gap: 8px; margin-bottom: var(--gap);
+  }
+  header h1 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: .02em; }
+  header h1 small { display: block; font-size: 12px; font-weight: 400; color: var(--muted); }
+  .status { display: flex; gap: 6px; align-items: center; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px; border-radius: 999px; font-size: 13px; font-weight: 600;
+    border: 1px solid currentColor; color: var(--muted); white-space: nowrap;
+  }
+  .pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .pill.ok { color: var(--ok); }
+  .pill.warn { color: var(--warn); }
+  .pill.demo { color: var(--info); }
+  .pill.stale { color: var(--warn); }
+  .pill[hidden] { display: none; }
+
+  /* ---------- Card grid ---------- */
+  .grid {
+    display: grid; gap: var(--gap);
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 240px), 1fr));
+  }
+  @media (min-width: 560px) { .span2 { grid-column: span 2; } }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 14px; min-width: 0;
+    transition: opacity .3s;
+  }
+  .card h2 {
+    margin: 0 0 8px; font-size: 12px; font-weight: 600; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .08em;
+  }
+  body.stale .card { opacity: .55; }   /* dim everything when data is old */
+  /* Before the first message the "--" placeholders are shown muted and thin */
+  body.nodata .big, body.nodata #pwrTxt { color: var(--muted); fill: var(--muted); font-weight: 300; }
+
+  .big {
+    font-size: clamp(48px, 13vw, 80px); font-weight: 750; line-height: 1;
+    font-variant-numeric: tabular-nums; letter-spacing: -.02em;
+  }
+  .hint { color: var(--muted); font-size: 13px; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .num { font-variant-numeric: tabular-nums; font-weight: 600; }
+
+  /* ---------- Ignition / gear ---------- */
+  #ign { color: var(--muted); }
+  #ign.on { color: var(--ok); }
+  .gear-wrap { display: flex; align-items: center; gap: 16px; }
+  .gear-hints { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }
+
+  /* ---------- Horizontal bars ---------- */
+  .bar {
+    position: relative; height: 14px; border-radius: 7px;
+    background: var(--panel-2); overflow: hidden; margin: 6px 0 10px;
+  }
+  .bar > i {
+    position: absolute; top: 0; bottom: 0; left: 0; width: 0;
+    border-radius: 7px; transition: width .1s linear, left .1s linear;
+  }
+  #brkBar { background: var(--brake); }
+  #ldrBar { background: linear-gradient(90deg, #6b7a8c, #1d2733); }
+  #steerBar { background: var(--motor); }
+  .bar.center::after {      /* centre line for the steering bar */
+    content: ""; position: absolute; left: 50%; top: 0; bottom: 0;
+    width: 2px; margin-left: -1px; background: var(--muted);
+  }
+
+  /* ---------- Gauge ---------- */
+  .gauge { display: block; width: 100%; max-width: 340px; margin: 0 auto; }
+  .gauge .track { stroke: var(--panel-2); }
+  #arcMotor { stroke: var(--motor); transition: stroke-dasharray .1s linear; }
+  #arcThr { stroke: var(--throttle); transition: stroke-dasharray .1s linear; }
+  .gauge .tick { stroke: var(--muted); stroke-width: 2; }
+  .gauge text { fill: var(--text); font-family: var(--font); text-anchor: middle; }
+  .gauge .lbl { fill: var(--muted); font-size: 11px; letter-spacing: .1em; }
+  .legend { display: flex; justify-content: center; gap: 16px; flex-wrap: wrap; font-size: 13px; }
+  .legend b { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; }
+
+  /* ---------- Indicators ---------- */
+  .ind-wrap { display: flex; justify-content: space-around; align-items: center; }
+  .arrow { width: 64px; height: 64px; }
+  .arrow path { fill: var(--off); stroke: transparent; stroke-width: 3; stroke-linejoin: round; }
+  .arrow.active path { stroke: var(--amber); }                 /* indicator switched on */
+  .arrow.lit path { fill: var(--amber); }                      /* lamp currently lit (blinking) */
+  .arrow.lit { filter: drop-shadow(0 0 6px var(--amber)); }
+
+  /* ---------- Steering wheel ---------- */
+  .wheel { width: 96px; height: 96px; flex: none; }
+  #wheelG { transform-origin: 50px 50px; transition: transform .1s linear; }
+  .wheel circle, .wheel path { fill: none; stroke: var(--text); stroke-width: 6; stroke-linecap: round; }
+  .wheel .mark { stroke: var(--motor); }
+
+  /* ---------- Headlight ---------- */
+  .lamp { width: 64px; height: 48px; flex: none; }
+  .lamp path { fill: none; stroke: var(--off); stroke-width: 4; stroke-linecap: round; }
+  .lamp.on path { stroke: var(--head); }
+  .lamp.on { filter: drop-shadow(0 0 5px var(--head)); }
+
+  /* ---------- Temperature ---------- */
+  #temp.hot { color: var(--danger); }
+  #temp.na { color: var(--muted); font-weight: 400; }   /* sensor not fitted */
+  #hotTag { color: var(--danger); font-weight: 700; visibility: hidden; }
+  #hotTag.show { visibility: visible; }
+
+  /* ---------- Switch chips ---------- */
+  .chips { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
+  .chip {
+    text-align: center; padding: 8px 2px; border-radius: 10px;
+    border: 1px solid var(--border); background: var(--panel-2);
+    font-weight: 700; font-size: 14px; color: var(--muted);
+  }
+  .chip small { display: block; font-weight: 400; font-size: 10px; }
+  .chip.on { background: var(--info); border-color: var(--info); color: #fff; }
+
+  /* ---------- 7-segment lamp mirror ---------- */
+  .seg-wrap { display: flex; align-items: center; gap: 16px; }
+  .seg { width: 70px; height: 116px; flex: none; }
+  .seg rect { fill: var(--off); }
+  .seg .on-head { fill: var(--head); }
+  .seg .on-ind { fill: var(--amber); }
+  .seg-key { font-size: 12px; color: var(--muted); margin: 0; padding-left: 16px; }
+
+  /* ---------- Footer ---------- */
+  footer { margin-top: var(--gap); font-size: 13px; color: var(--muted); }
+  footer .stats { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-bottom: 6px; }
+  #raw {
+    font-family: var(--mono); font-size: 12px; color: var(--text);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+
+  /* Respect users who ask for less motion: no transitions at all */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { transition: none !important; animation: none !important; }
+  }
+</style>
+</head>
+<body class="nodata">
+<div class="wrap">
+  <header>
+    <h1>EV Controller Interface<small>ESP32 live dashboard</small></h1>
+    <div class="status">
+      <span id="conn" class="pill warn">Connecting</span>
+      <span id="stale" class="pill stale" hidden>Stale</span>
+    </div>
+  </header>
+
+  <main class="grid">
+    <!-- Motor power gauge: outer arc = motor PWM duty, inner arc = throttle -->
+    <section class="card span2">
+      <h2>Power</h2>
+      <svg class="gauge" viewBox="0 0 200 172" role="img" aria-label="Motor power gauge">
+        <g id="ticks"></g>
+        <path class="track" d="M43.43 156.57 A80 80 0 1 1 156.57 156.57" fill="none" stroke-width="12" pathLength="100"/>
+        <path id="arcMotor" d="M43.43 156.57 A80 80 0 1 1 156.57 156.57" fill="none" stroke-width="12" pathLength="100" stroke-dasharray="0 100"/>
+        <path class="track" d="M54.75 145.25 A64 64 0 1 1 145.25 145.25" fill="none" stroke-width="6" pathLength="100"/>
+        <path id="arcThr" d="M54.75 145.25 A64 64 0 1 1 145.25 145.25" fill="none" stroke-width="6" pathLength="100" stroke-dasharray="0 100"/>
+        <text id="pwrTxt" x="100" y="108" font-size="44" font-weight="700">--</text>
+        <text class="lbl" x="100" y="128">MOTOR %</text>
+      </svg>
+      <div class="legend">
+        <span><b style="background:var(--motor)"></b>Motor <span class="num" id="dutyTxt">--</span>/255</span>
+        <span><b style="background:var(--throttle)"></b>Throttle <span class="num" id="thrTxt">--</span>%</span>
+      </div>
+    </section>
+
+    <!-- Ignition state (joystick button toggles it) -->
+    <section class="card">
+      <h2>Ignition</h2>
+      <div id="ign" class="big">--</div>
+      <p class="hint">Press JS (joystick) to start / stop</p>
+    </section>
+
+    <!-- Gear selector -->
+    <section class="card">
+      <h2>Gear</h2>
+      <div class="gear-wrap">
+        <div id="gear" class="big">-</div>
+        <div class="gear-hints">
+          <span>&#9650; S1 gear up</span>
+          <span>&#9660; S3 gear down</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Brake pedal and brake-light PWM -->
+    <section class="card">
+      <h2>Brake</h2>
+      <div class="row"><span>Pedal</span><span class="num"><span id="brkTxt">--</span>%</span></div>
+      <div class="bar"><i id="brkBar"></i></div>
+      <div class="row"><span>Brake light duty</span><span class="num"><span id="brkDuty">--</span>/255</span></div>
+    </section>
+
+    <!-- Turn indicators: outline = switched on, filled = lamp lit this instant -->
+    <section class="card">
+      <h2>Indicators</h2>
+      <div class="ind-wrap">
+        <svg id="arrL" class="arrow" viewBox="0 0 64 64" role="img" aria-label="Left indicator">
+          <path d="M4 32 L28 8 V22 H58 V42 H28 V56 Z"/>
+        </svg>
+        <svg id="arrR" class="arrow" viewBox="0 0 64 64" role="img" aria-label="Right indicator">
+          <path d="M60 32 L36 8 V22 H6 V42 H36 V56 Z"/>
+        </svg>
+      </div>
+      <p class="hint" style="text-align:center;margin:6px 0 0">S4 left &middot; S2 right</p>
+    </section>
+
+    <!-- Steering: rotating wheel plus a centre-zero bar -->
+    <section class="card">
+      <h2>Steering</h2>
+      <div class="row">
+        <svg class="wheel" viewBox="0 0 100 100" role="img" aria-label="Steering wheel">
+          <g id="wheelG">
+            <circle cx="50" cy="50" r="42"/>
+            <circle cx="50" cy="50" r="8"/>
+            <path d="M42 50 H10 M58 50 H90 M50 58 V90"/>
+            <path class="mark" d="M50 8 V16"/>
+          </g>
+        </svg>
+        <div class="big" style="font-size:36px"><span id="steerTxt">--</span></div>
+      </div>
+      <div class="bar center"><i id="steerBar"></i></div>
+      <div class="row hint"><span>L -100</span><span>0</span><span>+100 R</span></div>
+    </section>
+
+    <!-- Headlights and the LDR reading that drives them -->
+    <section class="card">
+      <h2>Headlights</h2>
+      <div class="row">
+        <svg id="lamp" class="lamp" viewBox="0 0 64 48" role="img" aria-label="Headlight">
+          <path d="M26 6 C10 6 10 42 26 42 Z M34 12 H58 M34 24 H60 M34 36 H58"/>
+        </svg>
+        <span id="headTxt" class="big" style="font-size:32px">--</span>
+      </div>
+      <div class="row" style="margin-top:8px"><span>LDR raw</span><span class="num" id="ldrTxt">--</span></div>
+      <div class="bar"><i id="ldrBar"></i></div>
+      <div class="row hint"><span>light</span><span>darker &rarr;</span></div>
+    </section>
+
+    <!-- Temperature (-999 from firmware = sensor not fitted) -->
+    <section class="card">
+      <h2>Temperature</h2>
+      <div><span id="temp" class="big">--</span><span class="hint"> &deg;C</span></div>
+      <p id="hotTag">OVERHEAT</p>
+    </section>
+
+    <!-- Physical switch states -->
+    <section class="card">
+      <h2>Switches</h2>
+      <div class="chips">
+        <div id="sw_s1" class="chip">S1<small>gear +</small></div>
+        <div id="sw_s2" class="chip">S2<small>right</small></div>
+        <div id="sw_s3" class="chip">S3<small>gear -</small></div>
+        <div id="sw_s4" class="chip">S4<small>left</small></div>
+        <div id="sw_js" class="chip">JS<small>ign</small></div>
+      </div>
+    </section>
+
+    <!-- 7-segment display mirroring the lamps on the board -->
+    <section class="card">
+      <h2>Lamp display</h2>
+      <div class="seg-wrap">
+        <svg class="seg" viewBox="0 0 60 100" role="img" aria-label="Seven segment lamp mirror">
+          <rect id="seg_a" x="10" y="2"  width="40" height="8" rx="3"/>
+          <rect id="seg_b" x="50" y="10" width="8" height="38" rx="3"/>
+          <rect id="seg_c" x="50" y="52" width="8" height="38" rx="3"/>
+          <rect id="seg_d" x="10" y="90" width="40" height="8" rx="3"/>
+          <rect id="seg_e" x="2"  y="52" width="8" height="38" rx="3"/>
+          <rect id="seg_f" x="2"  y="10" width="8" height="38" rx="3"/>
+          <rect id="seg_g" x="10" y="46" width="40" height="8" rx="3"/>
+        </svg>
+        <ul class="seg-key">
+          <li>a headlight</li>
+          <li>b+c right lamp</li>
+          <li>d brake light</li>
+          <li>e+f left lamp</li>
+        </ul>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="stats">
+      <span>seq <span class="num" id="seqTxt">--</span></span>
+      <span><span class="num" id="rateTxt">0</span> msg/s</span>
+      <span>ignored <span class="num" id="badTxt">0</span></span>
+    </div>
+    <pre id="raw">waiting for data...</pre>
+  </footer>
+</div>
+
+<script>
+'use strict';
+
+/* =====================================================================
+   PROTOCOL
+   Field order of the "$EV,..." transmit array. This MUST mirror the
+   order the firmware prints in. Index 0 here is token[1] of the line
+   because token[0] is the "$EV" tag itself.
+   ===================================================================== */
+const FIELDS = [
+  'seq',    // 0  message sequence counter
+  'ign',    // 1  ignition on (0/1)
+  'gear',   // 2  0 = N, 1..4
+  'thr',    // 3  throttle % 0..100
+  'brk',    // 4  brake pedal % 0..100
+  'steer',  // 5  steering -100..100 (negative = left)
+  'ldr',    // 6  LDR raw ADC 0..4095 (higher = darker)
+  'head',   // 7  headlights on (0/1)
+  'tempdC', // 8  temperature in tenths of a degree C (-999 = not fitted)
+  'hot',    // 9  overheat flag (0/1)
+  'indL',   // 10 left indicator switched on (0/1)
+  'indR',   // 11 right indicator switched on (0/1)
+  'lampL',  // 12 left indicator lamp lit right now (blinks)
+  'lampR',  // 13 right indicator lamp lit right now (blinks)
+  'motor',  // 14 motor PWM duty 0..255
+  'brake',  // 15 brake light PWM duty 0..255
+  's1',     // 16 switch S1 pressed (gear up)
+  's2',     // 17 switch S2 pressed (right indicator)
+  's3',     // 18 switch S3 pressed (gear down)
+  's4',     // 19 switch S4 pressed (left indicator)
+  'js'      // 20 joystick button pressed (ignition start/stop)
+];
+const TAG = '$EV';                     // data line prefix
+const HEADER_TAG = '#EV';              // header line prefix (field names) - ignored
+const TEMP_NOT_FITTED = -999;          // firmware sentinel for "no sensor"
+const INT_RE = /^-?\d+$/;              // a token must be a plain signed integer
+const STALE_MS = 1500;                 // no data for this long => "Stale"
+const RECONNECT_MS = 2000;             // WebSocket retry delay
+const DEAD_MS = 5000;                  // open socket but no data this long => assume dead, reconnect
+const DEMO_PERIOD_MS = 100;            // demo generator runs at 10 Hz
+
+/**
+ * Parse one line of the transmit array.
+ * Returns an object keyed by FIELDS names, or null if the line is not a
+ * valid "$EV" data line (wrong prefix, wrong token count, non-integer).
+ * Used by BOTH the live WebSocket path and the demo generator.
+ */
+function parseLine(line) {
+  if (typeof line !== 'string') return null;
+  const s = line.trim();                            // strip "\r\n" and spaces at the ends
+  if (!s.startsWith(TAG)) return null;              // not a data line
+  const tok = s.split(',');
+  if (tok.length !== FIELDS.length + 1) return null; // must be "$EV" + 21 values = 22 tokens
+  if (tok[0] !== TAG) return null;                  // reject e.g. "$EVX,..."
+  const out = {};
+  for (let i = 0; i < FIELDS.length; i++) {
+    const t = tok[i + 1];
+    if (!INT_RE.test(t)) return null;               // any non-integer => whole line rejected
+    out[FIELDS[i]] = parseInt(t, 10);
+  }
+  return out;
+}
+
+/* ---------- Small helpers ---------- */
+
+/** Limit v to the range lo..hi. */
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+/** Convert a 0..255 PWM duty to a whole percentage 0..100. */
+function dutyPct(d) { return Math.round(clamp(d, 0, 255) * 100 / 255); }
+
+/* =====================================================================
+   BROWSER-ONLY CODE
+   Everything below touches the DOM, so it only runs in a browser. This
+   lets parseLine() be loaded and unit tested in Node without errors.
+   ===================================================================== */
+if (typeof document !== 'undefined') {
+  (function () {
+    /** Shortcut for document.getElementById. */
+    const $ = (id) => document.getElementById(id);
+
+    // Cache every element we update so we never search the DOM at 10 Hz
+    const el = {
+      conn: $('conn'), stale: $('stale'),
+      arcMotor: $('arcMotor'), arcThr: $('arcThr'), pwrTxt: $('pwrTxt'),
+      dutyTxt: $('dutyTxt'), thrTxt: $('thrTxt'),
+      ign: $('ign'), gear: $('gear'),
+      brkTxt: $('brkTxt'), brkBar: $('brkBar'), brkDuty: $('brkDuty'),
+      arrL: $('arrL'), arrR: $('arrR'),
+      wheelG: $('wheelG'), steerTxt: $('steerTxt'), steerBar: $('steerBar'),
+      lamp: $('lamp'), headTxt: $('headTxt'), ldrTxt: $('ldrTxt'), ldrBar: $('ldrBar'),
+      temp: $('temp'), hotTag: $('hotTag'),
+      sw: { s1: $('sw_s1'), s2: $('sw_s2'), s3: $('sw_s3'), s4: $('sw_s4'), js: $('sw_js') },
+      seg: { a: $('seg_a'), b: $('seg_b'), c: $('seg_c'), d: $('seg_d'), e: $('seg_e'), f: $('seg_f'), g: $('seg_g') },
+      seqTxt: $('seqTxt'), rateTxt: $('rateTxt'), badTxt: $('badTxt'), raw: $('raw')
+    };
+
+    let lastRx = 0;        // performance.now() of the last valid message (0 = none yet)
+    let msgCount = 0;      // valid messages since the last rate calculation
+    let badCount = 0;      // lines that were not header and failed parseLine()
+    let ws = null;         // the live WebSocket (null in demo mode)
+
+    /** Only write text if it changed (avoids needless layout work). */
+    function setText(e, v) { if (e.textContent !== v) e.textContent = v; }
+
+    /** Set the connection pill text and colour class (ok / warn / demo). */
+    function setStatus(kind, text) {
+      el.conn.className = 'pill ' + kind;
+      setText(el.conn, text);
+    }
+
+    /** Fill an SVG arc (drawn with pathLength=100) to p percent. */
+    function setArc(path, p) { path.style.strokeDasharray = p + ' 100'; }
+
+    /** Draw 11 tick marks (every 10 %) around the 270 degree gauge. */
+    function drawTicks() {
+      const g = $('ticks');
+      const ns = 'http://www.w3.org/2000/svg';
+      for (let i = 0; i <= 10; i++) {
+        const a = (135 + 27 * i) * Math.PI / 180;   // 135 deg start, 270 deg sweep / 10 steps
+        const r1 = i % 5 === 0 ? 89 : 91, r2 = 96;  // longer ticks at 0, 50, 100 %
+        const ln = document.createElementNS(ns, 'line');
+        ln.setAttribute('class', 'tick');
+        ln.setAttribute('x1', (100 + r1 * Math.cos(a)).toFixed(2));
+        ln.setAttribute('y1', (100 + r1 * Math.sin(a)).toFixed(2));
+        ln.setAttribute('x2', (100 + r2 * Math.cos(a)).toFixed(2));
+        ln.setAttribute('y2', (100 + r2 * Math.sin(a)).toFixed(2));
+        g.appendChild(ln);
+      }
+    }
+
+    /**
+     * Update every widget from one parsed message.
+     * d = object from parseLine(), raw = the original text line.
+     */
+    function render(d, raw) {
+      // --- Power gauge: motor duty as %, plus throttle on the inner arc
+      const pwr = dutyPct(d.motor);
+      const thr = clamp(d.thr, 0, 100);
+      setArc(el.arcMotor, pwr);
+      setArc(el.arcThr, thr);
+      setText(el.pwrTxt, String(pwr));
+      setText(el.dutyTxt, String(clamp(d.motor, 0, 255)));
+      setText(el.thrTxt, String(thr));
+
+      // --- Ignition and gear
+      setText(el.ign, d.ign ? 'ON' : 'OFF');
+      el.ign.classList.toggle('on', d.ign === 1);
+      setText(el.gear, d.gear === 0 ? 'N' : String(d.gear));
+
+      // --- Brake pedal % and brake light duty
+      const brk = clamp(d.brk, 0, 100);
+      setText(el.brkTxt, String(brk));
+      el.brkBar.style.width = brk + '%';
+      setText(el.brkDuty, String(clamp(d.brake, 0, 255)));
+
+      // --- Indicators: "active" draws the outline, "lit" fills (blinks)
+      el.arrL.classList.toggle('active', d.indL === 1);
+      el.arrR.classList.toggle('active', d.indR === 1);
+      el.arrL.classList.toggle('lit', d.lampL === 1);
+      el.arrR.classList.toggle('lit', d.lampR === 1);
+
+      // --- Steering: wheel turns up to +/-90 deg, bar grows from the centre
+      const st = clamp(d.steer, -100, 100);
+      el.wheelG.style.transform = 'rotate(' + (st * 0.9) + 'deg)';
+      setText(el.steerTxt, (st > 0 ? '+' : '') + st);
+      const half = Math.abs(st) / 2;                     // 100 => half the bar width
+      el.steerBar.style.left = (st < 0 ? 50 - half : 50) + '%';
+      el.steerBar.style.width = half + '%';
+
+      // --- Headlights and LDR
+      el.lamp.classList.toggle('on', d.head === 1);
+      setText(el.headTxt, d.head ? 'ON' : 'OFF');
+      const ldr = clamp(d.ldr, 0, 4095);
+      setText(el.ldrTxt, ldr + ' / 4095');
+      el.ldrBar.style.width = (ldr * 100 / 4095).toFixed(1) + '%';
+
+      // --- Temperature: tenths of a degree, -999 means sensor not fitted
+      const noSensor = d.tempdC === TEMP_NOT_FITTED;
+      setText(el.temp, noSensor ? '--' : (d.tempdC / 10).toFixed(1));
+      el.temp.classList.toggle('na', noSensor);
+      el.temp.classList.toggle('hot', d.hot === 1);
+      el.hotTag.classList.toggle('show', d.hot === 1);
+
+      // --- Switch chips light while the switch is held
+      for (const k in el.sw) el.sw[k].classList.toggle('on', d[k] === 1);
+
+      // --- 7-segment mirror of the physical lamps
+      el.seg.a.classList.toggle('on-head', d.head === 1);   // a = headlight
+      el.seg.b.classList.toggle('on-ind', d.lampR === 1);   // b + c = right lamp
+      el.seg.c.classList.toggle('on-ind', d.lampR === 1);
+      el.seg.e.classList.toggle('on-ind', d.lampL === 1);   // e + f = left lamp
+      el.seg.f.classList.toggle('on-ind', d.lampL === 1);
+      // d = brake light, brightness follows its PWM duty (0 duty = unlit)
+      const bd = clamp(d.brake, 0, 255);
+      el.seg.d.style.fill = bd > 0 ? 'var(--brake)' : '';
+      el.seg.d.style.opacity = bd > 0 ? (0.15 + 0.85 * bd / 255).toFixed(2) : '';
+      // g is never used, so it always stays at the "off" colour
+
+      // --- Footer
+      setText(el.seqTxt, String(d.seq));
+      setText(el.raw, raw);
+    }
+
+    /**
+     * Handle one incoming text line (live or demo).
+     * Header lines are skipped silently, anything else that fails
+     * parseLine() is counted as "ignored".
+     */
+    function handleLine(line) {
+      if (!line) return;                               // empty chunk between newlines
+      if (line.startsWith(HEADER_TAG)) return;         // "#EV,..." field-name header
+      const d = parseLine(line);
+      if (!d) { badCount++; setText(el.badTxt, String(badCount)); return; }
+      if (lastRx === 0) document.body.classList.remove('nodata');  // first data: normal styling
+      lastRx = performance.now();
+      msgCount++;
+      render(d, line.trim());
+    }
+
+    /** A WebSocket frame may hold one or more lines, so split on newlines. */
+    function handleChunk(text) {
+      if (typeof text !== 'string') return;            // ignore binary frames
+      const lines = text.split(/\r?\n/);
+      for (let i = 0; i < lines.length; i++) handleLine(lines[i]);
+    }
+
+    /* ---------- Live WebSocket with auto-reconnect ---------- */
+
+    /** Open the WebSocket; on close, schedule another attempt. */
+    let wsOpenedAt = 0;    // performance.now() when the current socket was created
+
+    function connect() {
+      try {
+        ws = new WebSocket('ws://' + location.host + '/ws');
+      } catch (err) {                                  // e.g. bad URL - retry later
+        setStatus('warn', 'Reconnecting');
+        setTimeout(connect, RECONNECT_MS);
+        return;
+      }
+      wsOpenedAt = performance.now();                  // start the dead-socket watchdog from now
+      ws.onopen = () => setStatus('ok', 'Connected');
+      ws.onmessage = (ev) => handleChunk(ev.data);
+      ws.onerror = () => { /* onclose always follows; reconnect is handled there */ };
+      ws.onclose = () => {
+        setStatus('warn', 'Reconnecting');
+        ws = null;
+        setTimeout(connect, RECONNECT_MS);             // retry every 2 s
+      };
+    }
+
+    /* ---------- Demo mode: simulated firmware output ---------- */
+
+    // Simulator state that must persist between ticks
+    const demo = { t: 0, seq: 0, gearIdx: 0, head: 0 };
+    const DEMO_GEARS = [0, 1, 2, 3, 4, 3, 2, 1];       // gear cycle N,1..4..1
+
+    /**
+     * Build one plausible "$EV,..." line, exactly as the firmware would
+     * print it, so the demo exercises the real parseLine() path.
+     */
+    function demoLine() {
+      const t = demo.t++;                              // tick count (10 per second)
+      const sec = t / 10;
+
+      // Gear changes every 5 s; S1 / S3 flash on the tick the gear changes
+      let s1 = 0, s3 = 0;
+      if (t > 0 && t % 50 === 0) {
+        const prev = DEMO_GEARS[demo.gearIdx];
+        demo.gearIdx = (demo.gearIdx + 1) % DEMO_GEARS.length;
+        if (DEMO_GEARS[demo.gearIdx] > prev) s1 = 1; else s3 = 1;
+      }
+      const gear = DEMO_GEARS[demo.gearIdx];
+
+      // Brake for 1.5 s out of every 8 s; throttle sweeps otherwise
+      const braking = (sec % 8) >= 6.5;
+      const brk = braking ? Math.round(60 + 30 * Math.sin(sec * 4)) : 0;
+      const thr = braking ? 0 : Math.round(50 - 50 * Math.cos(sec * Math.PI / 3));
+      // Motor only drives in gear and when not braking
+      const motor = gear > 0 && !braking ? Math.round(thr * 2.55) : 0;
+
+      const steer = Math.round(100 * Math.sin(sec * 2 * Math.PI / 7));
+
+      // LDR drifts slowly through the headlight threshold (with hysteresis)
+      const ldr = clamp(Math.round(2300 + 1300 * Math.sin(sec * 2 * Math.PI / 20) + (Math.random() * 60 - 30)), 0, 4095);
+      if (ldr > 2400) demo.head = 1; else if (ldr < 2200) demo.head = 0;
+
+      // Indicators: left for 3 s, pause, right for 3 s, pause (10 s cycle)
+      const ph = sec % 10;
+      const indL = ph < 3 ? 1 : 0;
+      const indR = ph >= 5 && ph < 8 ? 1 : 0;
+      const blink = Math.floor(t / 3) % 2 === 0 ? 1 : 0;   // ~1.7 Hz flash
+      const lampL = indL && blink ? 1 : 0;
+      const lampR = indR && blink ? 1 : 0;
+      const s4 = t % 100 === 0 ? 1 : 0;                    // press S4 when left starts
+      const s2 = t % 100 === 50 ? 1 : 0;                   // press S2 when right starts
+
+      // Brake light: full when braking, dim tail light when headlights on
+      const brakeDuty = braking ? 255 : (demo.head ? 40 : 0);
+
+      demo.seq = (demo.seq + 1) % 65536;
+      const tempdC = Math.round(330 + 120 * Math.sin(sec * 2 * Math.PI / 30));  // 21..45 C over 30 s, tenths of a degree
+      const v = [demo.seq, 1, gear, thr, brk, steer, ldr, demo.head, tempdC, tempdC >= 400 ? 1 : 0,
+                 indL, indR, lampL, lampR, motor, brakeDuty, s1, s2, s3, s4, 0];
+      return TAG + ',' + v.join(',') + '\n';
+    }
+
+    /** Start the 10 Hz simulator instead of a WebSocket. */
+    function startDemo() {
+      setStatus('demo', 'Demo');
+      handleChunk(HEADER_TAG + ',' + FIELDS.join(',') + '\n');  // header, like the firmware sends
+      setInterval(() => handleChunk(demoLine()), DEMO_PERIOD_MS);
+    }
+
+    /* ---------- Housekeeping timers ---------- */
+
+    // Every 250 ms: show "Stale" if data has stopped arriving
+    setInterval(() => {
+      const isStale = lastRx > 0 && performance.now() - lastRx > STALE_MS;
+      el.stale.hidden = !isStale;
+      document.body.classList.toggle('stale', isStale);
+
+      // Watchdog: if the ESP32 rebooted (e.g. brown-out) the browser may never
+      // notice the old socket is dead. No data for DEAD_MS => drop it and reconnect.
+      if (ws && ws.readyState === WebSocket.OPEN &&
+          performance.now() - Math.max(lastRx, wsOpenedAt) > DEAD_MS) {
+        const dead = ws;                               // keep a handle to the old socket
+        ws = null;                                     // forget it so nothing else uses it
+        dead.onclose = null;                           // stop its onclose scheduling a 2nd retry
+        dead.close();                                  // ask the browser to close it
+        setStatus('warn', 'Reconnecting');
+        setTimeout(connect, RECONNECT_MS);             // open a fresh one
+      }
+    }, 250);
+
+    // Every second: publish the message rate and reset the counter
+    setInterval(() => {
+      setText(el.rateTxt, String(msgCount));
+      msgCount = 0;
+    }, 1000);
+
+    /* ---------- Start up ---------- */
+    drawTicks();
+    const demoMode = /[?&]demo=1(&|$)/.test(location.search) || location.protocol === 'file:';
+    if (demoMode) startDemo(); else connect();
+  })();
+}
+</script>
+</body>
+</html>
